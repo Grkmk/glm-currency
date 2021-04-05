@@ -3,6 +3,8 @@ package main
 import (
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/grkmk/glm-currency/data"
 	protos "github.com/grkmk/glm-currency/protos/currency"
@@ -14,7 +16,11 @@ import (
 )
 
 func main() {
-	log := hclog.Default()
+	log := hclog.New(&hclog.LoggerOptions{
+		Name:  "[product-currency]",
+		Level: hclog.DefaultLevel,
+		Color: hclog.AutoColor,
+	})
 
 	rates, err := data.NewRates(log)
 	if err != nil {
@@ -29,11 +35,24 @@ func main() {
 
 	reflection.Register(gs)
 
-	l, err := net.Listen("tcp", ":9092")
-	if err != nil {
-		log.Error("Unable to listen", "error", err)
-		os.Exit(1)
-	}
+	go func() {
+		log.Info("Starting server on port 9092")
 
-	gs.Serve(l)
+		l, err := net.Listen("tcp", ":9092")
+		if err != nil {
+			log.Error("Unable to listen", "error", err)
+			os.Exit(1)
+		}
+
+		gs.Serve(l)
+	}()
+
+	// trap sigterm or interrupt & gracefully shutdown server
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt)
+	signal.Notify(signalChannel, syscall.SIGTERM)
+
+	sig := <-signalChannel
+	log.Info("Received terminate, gracefully shutting down", sig)
+	gs.GracefulStop()
 }
