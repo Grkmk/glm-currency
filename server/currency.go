@@ -8,6 +8,8 @@ import (
 	"github.com/grkmk/glm-currency/data"
 	"github.com/grkmk/glm-currency/protos/currency"
 	"github.com/hashicorp/go-hclog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type Currency struct {
@@ -42,7 +44,17 @@ func (c *Currency) handleUpdates() {
 					c.log.Error("Unable to get updated rate", "base", rr.GetBase().String(), "destination", rr.GetDestination())
 				}
 
-				err = k.Send(&currency.RateResponse{Base: rr.Base, Destination: rr.Destination, Rate: r})
+				err = k.Send(
+					&currency.StreamingRateResponse{
+						Message: &currency.StreamingRateResponse_RateResponse{
+							RateResponse: &currency.RateResponse{
+								Base:        rr.Base,
+								Destination: rr.Destination,
+								Rate:        r,
+							},
+						},
+					},
+				)
 				if err != nil {
 					c.log.Error("Unable to send updated rate", "base", rr.GetBase().String(), "destination", rr.GetDestination())
 				}
@@ -54,6 +66,28 @@ func (c *Currency) handleUpdates() {
 
 func (c *Currency) GetRate(ctx context.Context, rr *currency.RateRequest) (*currency.RateResponse, error) {
 	c.log.Info("handle getrate", "base", rr.GetBase(), "destination", rr.GetDestination())
+
+	if rr.Base == rr.Destination {
+		// err := status.Errorf(
+		// 	codes.InvalidArgument,
+		// 	"Base currency %s cannot be the same as the destination currency %s",
+		// 	rr.Base.String(),
+		// 	rr.Destination.String(),
+		// )
+		errStatus := status.Newf(
+			codes.InvalidArgument,
+			"Base currency %s cannot be the same as the destination currency %s",
+			rr.Base.String(),
+			rr.Destination.String(),
+		)
+
+		errStatus, wde := errStatus.WithDetails(rr)
+		if wde != nil {
+			return nil, wde
+		}
+
+		return nil, errStatus.Err()
+	}
 
 	rate, err := c.rates.GetRate(rr.GetBase().String(), rr.GetDestination().String())
 	if err != nil {
@@ -81,6 +115,31 @@ func (c *Currency) SubscribeRates(src currency.Currency_SubscribeRatesServer) er
 		rrs, ok := c.subscriptions[src]
 		if !ok {
 			rrs = []*currency.RateRequest{}
+		}
+
+		var validationError *status.Status
+		for _, v := range rrs {
+			if v.Base == rr.Base && v.Destination == rr.Destination {
+				validationError = status.Newf(codes.AlreadyExists, "unable to subscribe for currency as subscription already exists")
+				validationError, err = validationError.WithDetails(rr)
+				if err != nil {
+					c.log.Error("Unable to add metadata to error", "error", err)
+					break
+				}
+
+				break
+			}
+		}
+
+		if validationError != nil {
+			src.Send(
+				&currency.StreamingRateResponse{
+					Message: &currency.StreamingRateResponse_Error{
+						Error: validationError.Proto(),
+					},
+				},
+			)
+			continue
 		}
 
 		rrs = append(rrs, rr)
